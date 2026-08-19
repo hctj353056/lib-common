@@ -5,7 +5,7 @@ import json
 import os
 from pathlib import Path
 
-from ..base import Plugin
+from ..base import Plugin, PluginError
 
 
 class BashPlugin(Plugin):
@@ -40,16 +40,21 @@ class BashPlugin(Plugin):
         
         # 执行脚本
         import subprocess
-        proc = subprocess.Popen(
-            ['bash', str(self.path)],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        
-        stdout, stderr = proc.communicate(timeout=30)
-        input_file.unlink(missing_ok=True)
+        try:
+            proc = subprocess.Popen(
+                ['bash', str(self.path)],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            stdout, stderr = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired as error:
+            proc.kill()
+            proc.communicate()
+            raise TimeoutError("Bash plugin execution timed out after 30 seconds") from error
+        finally:
+            input_file.unlink(missing_ok=True)
         
         if proc.returncode != 0:
             raise RuntimeError(f"Bash plugin failed: {stderr}")

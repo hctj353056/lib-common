@@ -65,6 +65,7 @@ class BaseAIClient:
         url = f"{self.base_url}{endpoint}"
         response = requests.post(url, json=payload, headers=self.headers, 
                                stream=True, timeout=60)
+        response.raise_for_status()
         
         for line in response.iter_lines():
             if line:
@@ -76,8 +77,8 @@ class BaseAIClient:
                     content = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
                     if content:
                         on_chunk(content)
-                except:
-                    pass
+                except (UnicodeDecodeError, json.JSONDecodeError, IndexError, AttributeError):
+                    continue
 
 
 class OpenAICompatible(BaseAIClient):
