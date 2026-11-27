@@ -31,8 +31,8 @@ class SSHClient:
             raise ValueError("timeout must be > 0")
         self.host, self.port, self.username = host, port, username
         self.timeout = timeout
-        self._password, self._key_path, self._passphrase = password, key_path, passphrase
-        self._known_hosts = known_hosts
+        self._password, self._key_path, self._passphrase = password, os.path.expanduser(key_path) if key_path else None, passphrase
+        self._known_hosts = os.path.expanduser(known_hosts) if known_hosts else None
         self._allow_unknown_hosts = allow_unknown_hosts
         self._client: Optional[paramiko.SSHClient] = None
 
