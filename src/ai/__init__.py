@@ -1,225 +1,86 @@
 # -*- coding: utf-8 -*-
-"""
-lib-common.ai: AI模型调用模块
-
-支持：
-- OpenAI兼容API
-- DeepSeek
-- 火山引擎ARK
-- 流式输出
-- Function Calling
-
-示例:
-    from lib_common.ai import OpenAICompatible, DeepSeek
-    
-    # OpenAI兼容格式
-    client = OpenAICompatible(base_url, api_key)
-    response = client.chat("gpt-4", "你好")
-    
-    # DeepSeek
-    client = DeepSeek(api_key)
-    response = client.chat("deepseek-chat", "解释量子力学")
-"""
-
-import requests
+"""OpenAI-compatible chat clients with Server-Sent Events streaming."""
 import json
-from typing import List, Dict, Optional, Generator, Any, Callable
 from dataclasses import dataclass
-
+from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Union
+import requests
 
 @dataclass
 class Message:
-    """对话消息"""
-    role: str  # system, user, assistant
-    content: str
+    role: str
+    content: Any
     name: Optional[str] = None
-    
     def to_dict(self) -> Dict:
-        d = {"role": self.role, "content": self.content}
-        if self.name:
-            d["name"] = self.name
-        return d
+        result = {"role": self.role, "content": self.content}
+        if self.name: result["name"] = self.name
+        return result
 
+def _normalize_messages(messages: Union[str, Message, Iterable[Union[Dict, Message]]]) -> List[Dict]:
+    if isinstance(messages, str): return [{"role": "user", "content": messages}]
+    if isinstance(messages, Message): return [messages.to_dict()]
+    return [message.to_dict() if isinstance(message, Message) else dict(message) for message in messages]
 
 class BaseAIClient:
-    """AI客户端基类"""
-    
-    def __init__(self, api_key: str, base_url: str):
-        self.api_key = api_key
-        self.base_url = base_url.rstrip("/")
-        self.headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}"
-        }
-    
+    def __init__(self, api_key: str, base_url: str, timeout: int = 60):
+        if not api_key: raise ValueError("api_key must not be empty")
+        if not base_url: raise ValueError("base_url must not be empty")
+        self.api_key = api_key; self.base_url = base_url.rstrip("/"); self.timeout = timeout
+        self.headers = {"Content-Type": "application/json", "Authorization": "Bearer %s" % api_key}
+        self.session = requests.Session()
     def _post(self, endpoint: str, payload: Dict) -> Dict:
-        """POST请求"""
-        url = f"{self.base_url}{endpoint}"
-        response = requests.post(url, json=payload, headers=self.headers, timeout=60)
-        response.raise_for_status()
-        return response.json()
-    
-    def _post_stream(self, endpoint: str, payload: Dict, 
-                     on_chunk: Callable[[str], None]):
-        """流式POST请求"""
-        url = f"{self.base_url}{endpoint}"
-        response = requests.post(url, json=payload, headers=self.headers, 
-                               stream=True, timeout=60)
-        response.raise_for_status()
-        
-        for line in response.iter_lines():
-            if line:
-                text = line.decode()[6:]  # 去掉 "data: " 前缀
-                if text == "[DONE]":
-                    break
-                try:
-                    data = json.loads(text)
-                    content = data.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                    if content:
-                        on_chunk(content)
-                except (UnicodeDecodeError, json.JSONDecodeError, IndexError, AttributeError):
-                    continue
-
+        response = self.session.post(self.base_url + endpoint, json=payload, headers=self.headers, timeout=self.timeout)
+        response.raise_for_status(); return response.json()
+    def _iter_stream(self, endpoint: str, payload: Dict) -> Generator[str, None, None]:
+        """Yield content deltas; ignore SSE comments, metadata and malformed frames."""
+        with self.session.post(self.base_url + endpoint, json=payload, headers=self.headers, stream=True, timeout=self.timeout) as response:
+            response.raise_for_status()
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if not raw_line: continue
+                line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+                if not line.startswith("data:"): continue
+                frame = line[5:].strip()
+                if frame == "[DONE]": break
+                try: data = json.loads(frame)
+                except json.JSONDecodeError: continue
+                choices = data.get("choices") or []
+                if not choices: continue
+                content = (choices[0].get("delta") or {}).get("content")
+                if isinstance(content, str) and content: yield content
+                elif isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and isinstance(item.get("text"), str): yield item["text"]
+    def _post_stream(self, endpoint: str, payload: Dict, on_chunk: Callable[[str], None]) -> None:
+        for chunk in self._iter_stream(endpoint, payload): on_chunk(chunk)
+    def close(self): self.session.close()
+    def __enter__(self): return self
+    def __exit__(self, exc_type, exc_val, exc_tb): self.close()
 
 class OpenAICompatible(BaseAIClient):
-    """OpenAI兼容格式的AI客户端"""
-    
-    def __init__(self, base_url: str, api_key: str):
-        """
-        初始化
-        
-        Args:
-            base_url: API地址，如 "https://api.openai.com/v1"
-            api_key: API密钥
-        """
-        super().__init__(api_key, base_url)
-    
-    def chat(
-        self,
-        model: str,
-        messages: List[Dict[str, str]],
-        temperature: float = 0.7,
-        max_tokens: Optional[int] = None,
-        stream: bool = False,
-        **kwargs
-    ) -> str:
-        """
-        对话接口
-        
-        Args:
-            model: 模型ID
-            messages: 消息列表 [{"role": "user", "content": "..."}]
-            temperature: 温度参数
-            max_tokens: 最大token数
-            stream: 是否流式输出
-            **kwargs: 其他参数
-        
-        Returns:
-            AI回复文本
-        """
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-        }
-        if max_tokens:
-            payload["max_tokens"] = max_tokens
-        payload.update(kwargs)
-        
-        data = self._post("/chat/completions", payload)
-        return data["choices"][0]["message"]["content"]
-    
-    def chat_stream(self, model: str, messages: List[Dict[str, str]], 
-                   temperature: float = 0.7) -> Generator[str, None, None]:
-        """
-        流式对话
-        
-        Args:
-            model: 模型ID
-            messages: 消息列表
-            temperature: 温度参数
-        
-        Yields:
-            逐字输出
-        """
-        result = []
-        
-        def on_chunk(chunk: str):
-            result.append(chunk)
-        
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-            "stream": True
-        }
-        
-        self._post_stream("/chat/completions", payload, on_chunk)
-        return "".join(result)
-
+    def __init__(self, base_url: str, api_key: str, timeout: int = 60): super().__init__(api_key, base_url, timeout)
+    def chat(self, model: str, messages, temperature: float = 0.7, max_tokens: Optional[int] = None, stream: bool = False, **kwargs) -> str:
+        normalized = _normalize_messages(messages)
+        if stream: return "".join(self.chat_stream(model, normalized, temperature, max_tokens=max_tokens, **kwargs))
+        payload = {"model": model, "messages": normalized, "temperature": temperature}
+        if max_tokens is not None: payload["max_tokens"] = max_tokens
+        payload.update(kwargs); data = self._post("/chat/completions", payload)
+        return data["choices"][0]["message"].get("content") or ""
+    def chat_stream(self, model: str, messages, temperature: float = 0.7, max_tokens: Optional[int] = None, **kwargs) -> Generator[str, None, None]:
+        payload = {"model": model, "messages": _normalize_messages(messages), "temperature": temperature, "stream": True}
+        if max_tokens is not None: payload["max_tokens"] = max_tokens
+        payload.update(kwargs); yield from self._iter_stream("/chat/completions", payload)
 
 class DeepSeek(OpenAICompatible):
-    """DeepSeek专用客户端"""
-    
     BASE_URL = "https://api.deepseek.com/v1"
-    
-    def __init__(self, api_key: str):
-        """
-        初始化DeepSeek客户端
-        
-        Args:
-            api_key: DeepSeek API密钥
-        """
-        super().__init__(self.BASE_URL, api_key)
-
+    def __init__(self, api_key: str, timeout: int = 60): super().__init__(self.BASE_URL, api_key, timeout)
 
 class VolcengineARK(BaseAIClient):
-    """火山引擎ARK专用客户端"""
-    
     BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
-    
-    def __init__(self, api_key: str):
-        """
-        初始化火山引擎ARK客户端
-        
-        Args:
-            api_key: ARK API密钥（不是AK/SK）
-        """
-        super().__init__(api_key, self.BASE_URL)
-    
-    def chat(
-        self,
-        model: str,  # 如 "doubao-pro-32k"
-        messages: List[Dict[str, str]],
-        temperature: float = 0.7,
-        max_tokens: Optional[int] = None
-    ) -> str:
-        """对话接口"""
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-        }
-        if max_tokens:
-            payload["max_tokens"] = max_tokens
-        
-        data = self._post("/chat/completions", payload)
-        return data["choices"][0]["message"]["content"]
+    def __init__(self, api_key: str, timeout: int = 60): super().__init__(api_key, self.BASE_URL, timeout)
+    def chat(self, model: str, messages, temperature: float = 0.7, max_tokens: Optional[int] = None, **kwargs) -> str:
+        payload = {"model": model, "messages": _normalize_messages(messages), "temperature": temperature}
+        if max_tokens is not None: payload["max_tokens"] = max_tokens
+        payload.update(kwargs); data = self._post("/chat/completions", payload)
+        return data["choices"][0]["message"].get("content") or ""
 
-
-def quick_chat(message: str, api_key: str, base_url: str, 
-               model: str = "gpt-3.5-turbo") -> str:
-    """
-    快速对话（单次调用）
-    
-    Args:
-        message: 用户消息
-        api_key: API密钥
-        base_url: API地址
-        model: 模型ID
-    
-    Returns:
-        AI回复
-    """
-    client = OpenAICompatible(base_url, api_key)
-    return client.chat(model, [{"role": "user", "content": message}])
+def quick_chat(message: str, api_key: str, base_url: str, model: str = "gpt-3.5-turbo") -> str:
+    with OpenAICompatible(base_url, api_key) as client: return client.chat(model, message)
