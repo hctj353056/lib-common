@@ -1,75 +1,47 @@
-"""
-Lua 适配器
-"""
-import shutil
-import json
+"""Lua plugin adapter executed through a temporary Lua bridge."""
+import os, shutil, tempfile
 from pathlib import Path
-
 from ..base import Plugin
 
-
-# Lua 通信桥脚本
-LUA_BRIDGE = """
+LUA_BRIDGE = r'''
 local json = require('cjson')
 local plugin_path = arg[1]
-
--- 读取输入
-local input = io.read("*all")
-local payload = json.decode(input)
-
--- 加载插件
+local payload = json.decode(io.read('*all'))
 local plugin = dofile(plugin_path)
-
-local result = nil
-local error_msg = nil
-
-local success, res = pcall(function()
-    if payload.action == "run" then
-        if type(plugin.run) == "function" then
-            return plugin:run()
-        else
-            return plugin
-        end
-    elseif payload.action == "call" then
-        local func = plugin[payload.function]
-        if type(func) == "function" then
-            return func(unpack(payload.args))
-        else
-            error("Function '" .. payload.function .. "' not found")
-        end
-    elseif payload.action == "eval" then
-        return assert(load(payload.code))()
-    end
+local ok, result = pcall(function()
+  if payload.action == 'run' then
+    if type(plugin.run) == 'function' then return plugin:run() end
+    return plugin
+  elseif payload.action == 'call' then
+    local fn = plugin[payload.function]
+    if type(fn) ~= 'function' then error('Function not found: ' .. payload.function) end
+    local args = payload.args or {}
+    if payload.kwargs and next(payload.kwargs) then table.insert(args, payload.kwargs) end
+    return fn((table.unpack or unpack)(args))
+  elseif payload.action == 'eval' then return assert(load(payload.code))() end
+  error('Unknown action: ' .. tostring(payload.action))
 end)
-
-if success then
-    result = res
-else
-    error_msg = res
-end
-
-print(json.encode({result = result, error = error_msg}))
-"""
-
+if ok then print(json.encode({result=result, error=nil}))
+else print(json.encode({result=nil, error=tostring(result)})) end
+'''
 
 class LuaPlugin(Plugin):
-    """
-    Lua 插件适配器
-    
-    需要 lua 或 luarocks 环境
-    依赖 cjson 库
-    """
-    
     EXTENSIONS = ('.lua',)
     INTERPRETER = 'lua'
-    
-    def __init__(self, path):
-        super().__init__(path)
-        # 检查 lua 是否可用
-        if not shutil.which('lua'):
-            raise EnvironmentError("Lua is not installed")
-    
+    def __init__(self, path, timeout=30):
+        super().__init__(path, timeout=timeout)
+        if not shutil.which('lua'): raise EnvironmentError("Lua is not installed")
+        self._bridge_path = None
     def build_command(self):
-        bridge_path = Path(__file__).parent / '_lua_bridge.lua'
-        bridge_path.write_text(LUA_BRIDGE)
-        return ['lua', str(bridge_path), str(self.path)]
+        fd, bridge_path = tempfile.mkstemp(prefix='lib_common_lua_', suffix='.lua')
+        os.close(fd)
+        Path(bridge_path).write_text(LUA_BRIDGE, encoding='utf-8')
+        self._bridge_path = bridge_path
+        return ['lua', bridge_path, str(self.path.resolve())]
+    def _execute(self, payload):
+        try: return super()._execute(payload)
+        finally:
+            if self._bridge_path:
+                try: os.unlink(self._bridge_path)
+                except OSError: pass
+                self._bridge_path = None

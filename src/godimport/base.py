@@ -1,103 +1,64 @@
-"""
-Plugin 基类 - 定义统一接口
-"""
+"""Cross-language plugin base class and execution protocol."""
 import json
 import subprocess
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 
 class Plugin(ABC):
-    """插件基类，所有语言适配器继承此类"""
-    
-    # 支持的文件扩展名
     EXTENSIONS: tuple = ()
-    
-    # 解释器命令（可选）
     INTERPRETER: Optional[str] = None
-    
-    def __init__(self, path: str):
+
+    def __init__(self, path: str, timeout: float = 30):
         self.path = Path(path)
         if not self.path.exists():
-            raise FileNotFoundError(f"Plugin file not found: {path}")
-    
+            raise FileNotFoundError("Plugin file not found: %s" % path)
+        if timeout <= 0:
+            raise ValueError("timeout must be > 0")
+        self.timeout = timeout
+
     @abstractmethod
     def build_command(self) -> list:
-        """构建执行命令"""
-        pass
-    
+        """Return the command used to launch this plugin adapter."""
+
     def call(self, func_name: str, *args, **kwargs) -> Any:
-        """
-        调用插件中的函数
-        统一通过 JSON-RPC 通信
-        """
-        payload = {
-            "action": "call",
-            "function": func_name,
-            "args": args,
-            "kwargs": kwargs
-        }
-        return self._execute(payload)
-    
+        return self._execute({"action": "call", "function": func_name,
+                             "args": args, "kwargs": kwargs})
+
     def run(self) -> Any:
-        """执行插件（无参数）"""
-        payload = {"action": "run"}
-        return self._execute(payload)
-    
+        return self._execute({"action": "run"})
+
     def eval(self, code: str) -> Any:
-        """执行代码片段"""
-        payload = {
-            "action": "eval",
-            "code": code
-        }
-        return self._execute(payload)
-    
-    def _execute(self, payload: Dict) -> Any:
-        """通过子进程执行，返回结果"""
-        cmd = self.build_command()
-        
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        
-        stdout, stderr = proc.communicate(
-            input=json.dumps(payload),
-            timeout=30
-        )
-        
-        if proc.returncode != 0:
-            raise RuntimeError(f"Plugin execution failed: {stderr}")
-        
-        result = json.loads(stdout)
-        
+        """Evaluate arbitrary code in the plugin runtime; only use trusted plugins."""
+        return self._execute({"action": "eval", "code": code})
+
+    def _execute(self, payload: dict) -> Any:
+        command = self.build_command()
+        if not command:
+            raise PluginError("This adapter does not use the subprocess execution path")
+        try:
+            process = subprocess.run(command, input=json.dumps(payload), text=True,
+                                     capture_output=True, timeout=self.timeout)
+        except subprocess.TimeoutExpired as error:
+            raise TimeoutError("Plugin timed out after %s seconds" % self.timeout) from error
+        if process.returncode != 0:
+            raise RuntimeError("Plugin execution failed (exit %s): %s" %
+                               (process.returncode, process.stderr.strip()))
+        try:
+            result = json.loads(process.stdout)
+        except json.JSONDecodeError as error:
+            raise PluginError("Plugin returned invalid JSON: %s" % process.stdout[:300]) from error
         if result.get("error"):
             raise PluginError(result["error"])
-        
         return result.get("result")
 
 
 class PluginError(Exception):
-    """插件执行错误"""
-    pass
+    """Raised when a plugin reports a protocol or execution error."""
 
 
 def detect_language(path: str) -> str:
-    """根据扩展名检测语言"""
-    ext = Path(path).suffix.lower()
-    lang_map = {
-        '.py': 'python',
-        '.js': 'javascript',
-        '.mjs': 'javascript',
-        '.lua': 'lua',
-        '.rb': 'ruby',
-        '.php': 'php',
-        '.sh': 'bash',
-        '.go': 'go',
-        '.rs': 'rust',
-    }
-    return lang_map.get(ext, 'unknown')
+    extension = Path(path).suffix.lower()
+    return {".py": "python", ".js": "javascript", ".mjs": "javascript",
+            ".lua": "lua", ".sh": "bash", ".bash": "bash"}.get(extension, "unknown")

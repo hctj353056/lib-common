@@ -1,79 +1,32 @@
-"""
-Bash 适配器
-"""
-import json
-import os
+"""Bash plugin adapter using a temporary JSON input file."""
+import json, os, tempfile, subprocess
 from pathlib import Path
-
 from ..base import Plugin, PluginError
 
-
 class BashPlugin(Plugin):
-    """
-    Bash 脚本适配器
-    
-    通过环境变量传递参数
-    脚本需要输出 JSON 格式结果
-    """
-    
     EXTENSIONS = ('.sh', '.bash')
     INTERPRETER = 'bash'
-    
-    def build_command(self):
-        return ['bash', str(self.path)]
-    
+    def build_command(self): return ['bash', str(self.path)]
     def _execute(self, payload):
-        """
-        Bash 通过环境变量 + JSON 文件通信
-        因为 bash 不方便 stdin/stdout 复杂交互
-        """
-        import tempfile
-        import uuid
-        
-        # 生成临时 JSON 文件传递输入
-        input_file = Path(tempfile.gettempdir()) / f"godimport_{uuid.uuid4().hex}.json"
-        input_file.write_text(json.dumps(payload))
-        
-        # 设置环境变量
-        env = os.environ.copy()
-        env['GODIMPORT_INPUT'] = str(input_file)
-        
-        # 执行脚本
-        import subprocess
+        fd, input_name = tempfile.mkstemp(prefix='godimport_', suffix='.json')
         try:
-            proc = subprocess.Popen(
-                ['bash', str(self.path)],
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            stdout, stderr = proc.communicate(timeout=30)
-        except subprocess.TimeoutExpired as error:
-            proc.kill()
-            proc.communicate()
-            raise TimeoutError("Bash plugin execution timed out after 30 seconds") from error
+            with os.fdopen(fd, 'w', encoding='utf-8') as file: json.dump(payload, file)
+            env = os.environ.copy(); env['GODIMPORT_INPUT'] = input_name
+            try:
+                process = subprocess.run(self.build_command(), env=env, text=True,
+                                        capture_output=True, timeout=self.timeout)
+            except subprocess.TimeoutExpired as error:
+                raise TimeoutError('Bash plugin timed out after %s seconds' % self.timeout) from error
+            if process.returncode != 0:
+                raise RuntimeError('Bash plugin failed: %s' % process.stderr.strip())
+            try: result = json.loads(process.stdout)
+            except json.JSONDecodeError as error:
+                raise PluginError('Bash plugin returned invalid JSON') from error
+            if result.get('error'): raise PluginError(result['error'])
+            return result.get('result')
         finally:
-            input_file.unlink(missing_ok=True)
-        
-        if proc.returncode != 0:
-            raise RuntimeError(f"Bash plugin failed: {stderr}")
-        
-        # 脚本应输出 JSON
-        result = json.loads(stdout)
-        
-        if result.get("error"):
-            raise PluginError(result["error"])
-        
-        return result.get("result")
-    
-    def run(self):
-        return self._execute({"action": "run"})
-    
+            try: os.unlink(input_name)
+            except OSError: pass
+    def run(self): return self._execute({'action': 'run'})
     def call(self, func_name, *args, **kwargs):
-        return self._execute({
-            "action": "call",
-            "function": func_name,
-            "args": args,
-            "kwargs": kwargs
-        })
+        return self._execute({'action': 'call', 'function': func_name, 'args': args, 'kwargs': kwargs})
