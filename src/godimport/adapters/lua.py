@@ -17,7 +17,7 @@ local ok, result = pcall(function()
     if type(fn) ~= 'function' then error('Function not found: ' .. payload.function) end
     local args = payload.args or {}
     if payload.kwargs and next(payload.kwargs) then table.insert(args, payload.kwargs) end
-    return fn((table.unpack or unpack)(args)
+    return fn((table.unpack or unpack)(args))
   elseif payload.action == 'eval' then return assert(load(payload.code))() end
   error('Unknown action: ' .. tostring(payload.action))
 end)
